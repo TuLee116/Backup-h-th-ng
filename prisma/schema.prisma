@@ -1,0 +1,17 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Full schema, constraints, triggers and SQL functions live in prisma/migrations.
+// Server queries use Prisma's parameterized SQL API. This minimal model exists
+// for client generation; never use db push, which would drop SQL-only objects.
+model ExamSettings {
+  id Int @id
+
+  @@map("exam_settings")
+}

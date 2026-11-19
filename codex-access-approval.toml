@@ -1,0 +1,48 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+# Mau cau hinh; file nay KHONG duoc Codex tu dong nap.
+# Gop cac khoa vao %USERPROFILE%\.codex\config.toml, tranh trung khoa/table.
+# Mo phien moi va kiem tra quyen thuc te; Full Access/CLI override co the ghi de.
+# Tai lieu: https://learn.chatgpt.com/docs/agent-approvals-security
+
+# Yeu cau nang quyen duoc gui den ban, khong dung Auto-review.
+# on-request KHONG hoi truoc moi lenh: lenh trong sandbox van tu chay.
+approval_policy = "on-request"
+approvals_reviewer = "user"
+
+# Mac dinh chi doc; thao tac vuot sandbox co the can ban duyet nang quyen.
+# Neu muon tu sua/build trong workspace, doi thanh "workspace-write".
+# Khi do viec sua/xoa file trong workspace co the chay khong hoi.
+sandbox_mode = "read-only"
+allow_login_shell = false
+web_search = "disabled"
+
+# Chi ap dung neu chuyen sandbox_mode sang "workspace-write".
+[sandbox_workspace_write]
+network_access = false
+writable_roots = []
+exclude_tmpdir_env_var = true
+exclude_slash_tmp = true
+
+# Han che bien moi truong ke thua vao tien trinh con.
+# KHONG ngan doc secret tu file .env, credential store hoac MCP.
+[shell_environment_policy]
+inherit = "core"
+ignore_default_excludes = false
+
+[shell_environment_policy.filters]
+"*TOKEN*" = "exclude"
+"*SECRET*" = "exclude"
+"*PASSWORD*" = "exclude"
+"*KEY*" = "exclude"
+"SUPABASE_*" = "exclude"
+"ADMIN_*" = "exclude"
+"DATABASE_URL" = "exclude"
+"PGPASSWORD" = "exclude"
+
+[windows]
+sandbox = "elevated"
+
+# Bao mat du lieu: dung checkout/container khong co secret production,
+# .env.local, loadtest/participants.local.txt hay ban export thi sinh.
+# .gitignore va AGENTS.md khong phai co che chan doc file.
+# Quyen MCP/app duoc quan ly rieng; kiem tra tung ket noi.

@@ -1,0 +1,238 @@
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { z } from 'zod';
+import { sb, sha256, newToken, ip, cookie, setCookie, clearCookie, limited, begin, fail } from '../_lib/server.js';
+import { isCompanyEmail, normalizeEmail } from '../_lib/pure.js';
+
+const Start = z.object({
+  fullName: z.string().trim().min(2).max(120),
+  email: z.string().trim().email().max(254)
+    .refine(isCompanyEmail, 'Email phải có đuôi @tanminhnhan.com.vn.'),
+  position: z.string().trim().min(2).max(120),
+  level: z.string().trim().min(1).max(120),
+  mainProject: z.string().trim().min(1).max(200),
+});
+const Answer = z.object({
+  questionId: z.string().uuid(),
+  optionIds: z.array(z.string().min(1).max(32)).max(6).optional(),
+  essay: z.string().max(10000).optional(),
+}).refine((v) => (v.optionIds !== undefined) !== (v.essay !== undefined));
+const AnswersBatch = z.object({
+  answers: z.array(Answer).min(1).max(5),
+}).refine((v) => new Set(v.answers.map((answer) => answer.questionId)).size === v.answers.length);
+const Submit = z.object({ reason: z.enum(['manual', 'tab_switch', 'deadline']) });
+const ERR: Record<string, [number, string]> = {
+  not_open: [403, 'Kỳ thi chưa mở.'], closed: [403, 'Kỳ thi đã đóng.'],
+  email_not_allowed: [403, 'Email chưa có trong danh sách được phép tham gia. Vui lòng liên hệ quản trị viên.'],
+  email_used: [409, 'Email này đã được dùng để thi. Mỗi email chỉ được tham gia một lần.'],
+  invalid_project: [400, 'Công trình đã chọn không hợp lệ hoặc không còn trong danh sách. Hãy tải lại trang và chọn lại.'],
+  no_questions: [503, 'Chưa có câu hỏi nào đang hoạt động. Vui lòng báo quản trị viên kiểm tra ngân hàng câu hỏi.'],
+  invalid_question_count: [503, 'Cấu hình số câu hỏi không hợp lệ. Vui lòng báo quản trị viên kiểm tra.'],
+  not_ready: [503, 'Ngân hàng câu hỏi chưa đủ số câu đang hoạt động theo cấu hình hiện tại. Vui lòng báo quản trị viên kiểm tra.'],
+};
+
+async function attemptId(req: VercelRequest): Promise<string | null> {
+  const t = cookie(req, 'attempt');
+  if (!t || t.length !== 43) return null;
+  const { data } = await sb.from('exam_attempts').select('id').eq('token_hash', sha256(t)).maybeSingle();
+  return data?.id ?? null;
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const action = String(req.query.action);
+  const rid = begin(req, res, action === 'answers' ? 64 * 1024 : 16_384);
+  if (!rid) return;
+  try {
+    const A = ip(req);
+
+    if (action === 'info' && req.method === 'GET') {
+      const [{ data: s, error }, { data: projects, error: projectsError }] = await Promise.all([
+        sb.from('exam_settings')
+          .select('title,logo_url,opening_at,closing_at,duration_minutes,mc_question_count,essay_question_count,mc_points_per_question,essay_points_per_question,passing_score,active')
+          .eq('id', 1).single(),
+        sb.from('exam_projects').select('id,name').eq('active', true).order('name'),
+      ]);
+      if (error) throw error;
+      if (projectsError) throw projectsError;
+      return res.json({ title: s.title, logoUrl: s.logo_url, openingAt: s.opening_at, closingAt: s.closing_at,
+        durationMinutes: s.duration_minutes, multipleChoiceCount: s.mc_question_count, essayCount: s.essay_question_count,
+        mcPointsPerQuestion: s.mc_points_per_question, essayPointsPerQuestion: s.essay_points_per_question,
+        passingScore: s.passing_score,
+        projects, active: s.active, serverNow: new Date().toISOString(),
+        hasAttemptCookie: !!cookie(req, 'attempt') });
+    }
+
+    if (action === 'start' && req.method === 'POST') {
+      // Per-IP limit is generous: many candidates may share one office NAT address.
+      if (await limited('start:' + A, 240, 60)) return res.status(429).json({ error: 'Quá nhiều yêu cầu. Vui lòng thử lại sau.' });
+      const p = Start.safeParse(req.body);
+      if (!p.success) return res.status(400).json({ error: 'Dữ liệu không hợp lệ.', fields: p.error.flatten().fieldErrors });
+      const token = newToken();
+      const { error } = await sb.rpc('start_attempt', {
+        p_name: p.data.fullName, p_email: normalizeEmail(p.data.email), p_position: p.data.position,
+        p_level: p.data.level, p_main_project: p.data.mainProject,
+        p_token_hash: sha256(token),
+      });
+      if (error) {
+        const k = Object.keys(ERR).find((x) => error.message.includes(x));
+        if (k) return res.status(ERR[k][0]).json({ error: ERR[k][1] });
+        throw error;
+      }
+      setCookie(res, 'attempt', token, 7200);
+      return res.status(201).json({ ok: true });
+    }
+
+    const id = await attemptId(req);
+    if (!id) return res.status(401).json({ error: 'Phiên thi không hợp lệ.' });
+
+    if (action === 'submission' && req.method === 'GET') {
+      if (await limited('candidate-submission:' + id, 30, 60))
+        return res.status(429).json({ error: 'Bạn đã tải bài làm quá nhiều lần. Vui lòng thử lại sau.' });
+      const { data: attempt, error: attemptError } = await sb.from('exam_attempts')
+        .select('full_name,status,question_order,form_no').eq('id', id).single();
+      if (attemptError) throw attemptError;
+      if (attempt.status === 'in_progress')
+        return res.status(409).json({ error: 'Bài thi chưa được nộp.' });
+      const { data: savedAnswers, error: answersError } = await sb.from('exam_answers')
+        .select('question_id,selected_options,essay_response').eq('attempt_id', id);
+      if (answersError) throw answersError;
+      const answers = (savedAnswers ?? []) as {
+        question_id: string; selected_options: string[]; essay_response: string | null;
+      }[];
+      const answersByQuestion = new Map(answers.map((answer) => [answer.question_id, answer]));
+      return res.json({
+        candidateName: attempt.full_name,
+        formNo: attempt.form_no,
+        answers: (attempt.question_order as string[]).map((questionId, index) => {
+          const answer = answersByQuestion.get(questionId);
+          return {
+            number: index + 1,
+            selectedOptions: answer?.selected_options ?? [],
+            essayResponse: answer?.essay_response ?? null,
+          };
+        }),
+      });
+    }
+
+    if (action === 'review-pdf' && req.method === 'GET') {
+      if (await limited('candidate-review-pdf:' + id, 10, 60))
+        return res.status(429).json({ error: 'Bạn tải PDF đối chiếu quá nhiều lần. Vui lòng thử lại sau.' });
+      const { data: attempt, error: attemptError } = await sb.from('exam_attempts')
+        .select('id,full_name,normalized_email,position,candidate_level,main_project,question_order,correct_count,incorrect_count,scored_points,total_points,result,started_at,submitted_at,status,submit_reason,mc_points_per_question,essay_points_per_question,passing_score')
+        .eq('id', id).single();
+      if (attemptError) throw attemptError;
+      if (attempt.status !== 'in_progress')
+        return res.status(409).json({ error: 'PDF đối chiếu chỉ được xuất khi bài thi đang làm.' });
+
+      const [{ data: questions, error: questionsError }, { data: answers, error: answersError }] = await Promise.all([
+        sb.from('exam_questions')
+          .select('id,question_text,options,question_type,points,question_keys(correct_options,reference_answer)')
+          .in('id', attempt.question_order),
+        sb.from('exam_answers')
+          .select('attempt_id,question_id,selected_options,essay_response')
+          .eq('attempt_id', id),
+      ]);
+      if (questionsError) throw questionsError;
+      if (answersError) throw answersError;
+
+      const { buildReviewPdf, reviewPdfName } = await import('../_lib/review-pdf.js');
+      const pdf = await buildReviewPdf({ attempt, questions, answers });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${reviewPdfName(attempt, 0)}"`);
+      return res.status(200).send(pdf);
+    }
+
+    if (action === 'export' && req.method === 'GET') {
+      if (await limited('candidate-export:' + id, 10, 60))
+        return res.status(429).json({ error: 'Bạn tải bài làm quá nhiều lần. Vui lòng thử lại sau.' });
+      const { data: attempt, error: attemptError } = await sb.from('exam_attempts')
+        .select('id,full_name,normalized_email,position,candidate_level,main_project,question_order,started_at,submitted_at,status,submit_reason')
+        .eq('id', id).single();
+      if (attemptError) throw attemptError;
+      if (attempt.status === 'in_progress' || !attempt.submitted_at)
+        return res.status(409).json({ error: 'Bạn chỉ có thể tải bài làm sau khi đã nộp bài.' });
+
+      const { data: questions, error: questionsError } = await sb.from('exam_questions')
+        .select('id,question_text,options,question_type')
+        .in('id', attempt.question_order);
+      if (questionsError) throw questionsError;
+      const { data: answers, error: answersError } = await sb.from('exam_answers')
+        .select('question_id,selected_options,essay_response')
+        .eq('attempt_id', id);
+      if (answersError) throw answersError;
+
+      const { buildCandidatePdf, candidatePdfName } = await import('../_lib/review-pdf.js');
+      const pdf = await buildCandidatePdf({ attempt, questions, answers });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${candidatePdfName(attempt)}"`);
+      return res.status(200).send(pdf);
+    }
+
+    if (action === 'state' && req.method === 'GET') {
+      const [stateResult, settingsResult] = await Promise.all([
+        sb.rpc('attempt_state', { p_attempt: id }),
+        sb.from('exam_settings').select('display_mode').eq('id', 1).single(),
+      ]);
+      const { data, error } = stateResult;
+      if (error) throw error;
+      const state = data ? { ...data, attemptId: id } : data;
+      if (data?.status === 'in_progress') {
+        if (settingsResult.error) throw settingsResult.error;
+        return res.json({ ...state, displayMode: settingsResult.data.display_mode === 'all' ? 'all' : 'paged' });
+      }
+      return res.json(state);
+    }
+
+    if (action === 'answers' && req.method === 'PUT') {
+      if (await limited('ans:' + id, 120, 60)) return res.status(429).json({ error: 'Quá nhiều yêu cầu.' });
+      const p = AnswersBatch.safeParse(req.body);
+      if (!p.success) return res.status(400).json({ error: 'Danh sách đáp án không hợp lệ.' });
+      const { data, error } = await sb.rpc('save_answers', {
+        p_attempt: id,
+        p_answers: p.data.answers,
+      });
+      if (error) {
+        if (error.message.includes('invalid_answers')) return res.status(400).json({ error: 'Một hoặc nhiều đáp án không hợp lệ.' });
+        throw error;
+      }
+      if (data === 'ok') return res.json({ ok: true });
+      if (data === 'invalid') return res.status(400).json({ error: 'Một hoặc nhiều đáp án không hợp lệ.' });
+      if (data === 'not_found') return res.status(404).json({ error: 'Không tìm thấy bài thi.' });
+      return res.status(409).json({ error: 'expired' });
+    }
+
+    if (action === 'answer' && req.method === 'PUT') {
+      if (await limited('ans:' + id, 120, 60)) return res.status(429).json({ error: 'Quá nhiều yêu cầu.' });
+      const p = Answer.safeParse(req.body);
+      if (!p.success) return res.status(400).json({ error: 'Dữ liệu không hợp lệ.' });
+      const { data, error } = await sb.rpc('save_answer', {
+        p_attempt: id, p_question: p.data.questionId,
+        p_options: p.data.optionIds ?? [], p_essay: p.data.essay ?? null,
+      });
+      if (error) throw error;
+      if (data === 'ok') return res.json({ ok: true });
+      if (data === 'invalid') return res.status(400).json({ error: 'Câu hỏi hoặc đáp án không hợp lệ.' });
+      return res.status(409).json({ error: 'expired' });
+    }
+
+    if (action === 'submit' && req.method === 'POST') {
+      if (await limited('sub:' + id, 20, 60)) return res.status(429).json({ error: 'Quá nhiều yêu cầu.' });
+      const p = Submit.safeParse(req.body);
+      if (!p.success) return res.status(400).json({ error: 'Dữ liệu không hợp lệ.' });
+      const { data, error } = await sb.rpc('finalize_and_get_attempt_state', {
+        p_attempt: id,
+        p_reason: p.data.reason,
+      });
+      if (error) throw error;
+      return res.json(data);
+    }
+
+    if (action === 'reset' && req.method === 'POST') {
+      const { data, error } = await sb.from('exam_attempts').select('status').eq('id', id).single();
+      if (error) throw error;
+      if (data.status === 'in_progress') return res.status(409).json({ error: 'Bạn cần nộp bài trước khi quay lại trang chủ.' });
+      clearCookie(res, 'attempt');
+      return res.json({ ok: true });
+    }
+    return res.status(404).json({ error: 'Không tìm thấy.' });
+  } catch (e) { return fail(res, rid, e); }
+}
